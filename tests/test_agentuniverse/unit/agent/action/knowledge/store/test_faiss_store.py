@@ -132,19 +132,68 @@ class TestFAISSStore(unittest.TestCase):
             {"index_type": "IndexFlatL2"},
             {"index_type": "IndexFlatIP"},
             {"index_type": "IndexIVFFlat", "nlist": 4, "nprobe": 2},
-            {"index_type": "IndexIVFPQ", "nlist": 4, "nprobe": 2, "m": 2, "nbits": 8},
+            {"index_type": "IndexIVFPQ", "nlist": 4, "nprobe": 2, "m": 2, "nbits": 2},
             {"index_type": "IndexHNSWFlat", "M": 8, "efConstruction": 40, "efSearch": 20},
         ]
 
         for config in index_configs:
             with self.subTest(index_type=config["index_type"]):
                 store = self.create_store(**config)
+                store.index_path = None
+                store.metadata_path = None
                 store._new_client()
 
                 # Insert documents to trigger index creation
                 store.insert_document(self.test_documents)
                 self.assertIsNotNone(store.faiss_index)
                 self.assertEqual(store.get_document_count(), 5)
+
+    def test_ivf_training_rejects_undersized_batches_without_mutating_state(self):
+        """Test IVF training rejects invalid batches before mutating store state."""
+        cases = [
+            ("IndexIVFFlat", {"nlist": 6}, 6, ("nlist=6",)),
+            ("IndexIVFPQ", {"nlist": 4, "m": 2, "nbits": 3}, 8, ("nlist=4", "nbits=3")),
+            ("IndexIVFPQ", {"nlist": 6, "m": 2, "nbits": 2}, 6, ("nlist=6", "nbits=2")),
+        ]
+
+        for index_type, config, minimum, expected_config in cases:
+            with self.subTest(index_type=index_type, config=config):
+                store = self.create_store(index_type=index_type, **config)
+                store.index_path = None
+                store.metadata_path = None
+                store._new_client()
+
+                with self.assertRaises(ValueError) as context:
+                    store.insert_document(self.test_documents)
+
+                message = str(context.exception)
+                self.assertIn(index_type, message)
+                self.assertIn("received 5", message)
+                self.assertIn(f"minimum {minimum}", message)
+                for expected in expected_config:
+                    self.assertIn(expected, message)
+                self.assertIsNone(store.faiss_index)
+                self.assertEqual(store.get_document_count(), 0)
+                self.assertEqual(store.document_store, {})
+                self.assertEqual(store.id_to_index, {})
+                self.assertEqual(store.index_to_id, {})
+                self.assertEqual(store._next_index, 0)
+
+    def test_ivfpq_training_accepts_minimum_batch_after_rejection(self):
+        """Test a rejected insert can be retried with the minimum valid batch."""
+        store = self.create_store(index_type="IndexIVFPQ", nlist=4, m=2, nbits=3)
+        store.index_path = None
+        store.metadata_path = None
+        store._new_client()
+
+        with self.assertRaises(ValueError):
+            store.insert_document(self.test_documents)
+
+        store.insert_document(self.large_dataset[:8])
+
+        self.assertIsNotNone(store.faiss_index)
+        self.assertTrue(store.faiss_index.is_trained)
+        self.assertEqual(store.get_document_count(), 8)
 
     def test_unsupported_index_type(self):
         """Test handling of unsupported index types."""
@@ -508,9 +557,11 @@ class TestFAISSStore(unittest.TestCase):
 
         for index_type in index_types:
             with self.subTest(index_type=index_type):
-                config = {"nlist": 4, "m": 2, "nbits": 8} if "IVF" in index_type else {}
+                config = {"nlist": 4, "m": 2, "nbits": 4} if "IVF" in index_type else {}
 
                 store = self.create_store(index_type=index_type, **config)
+                store.index_path = None
+                store.metadata_path = None
                 store._new_client()
 
                 # Insert moderate dataset

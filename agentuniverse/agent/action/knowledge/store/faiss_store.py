@@ -324,19 +324,35 @@ class FAISSStore(Store):
         # Initialize index if needed
         if self.faiss_index is None:
             dimension = len(embeddings_to_add[0])
-            self.faiss_index = self._create_faiss_index(dimension)
+            index_type = self.index_config.get("index_type", "IndexFlatL2")
+
+            if index_type in ("IndexIVFFlat", "IndexIVFPQ"):
+                nlist = self.index_config.get("nlist", 100)
+                minimum_training_vectors = nlist
+                requirement = f"nlist={nlist}"
+                if index_type == "IndexIVFPQ":
+                    nbits = self.index_config.get("nbits", 8)
+                    codebook_size = 2**nbits
+                    minimum_training_vectors = max(nlist, codebook_size)
+                    requirement = f"max(nlist={nlist}, 2 ** nbits={codebook_size} where nbits={nbits})"
+
+                if len(embeddings_to_add) < minimum_training_vectors:
+                    INSUFFICIENT_TRAINING_DATA_MSG = (
+                        f"Cannot train {index_type}: received {len(embeddings_to_add)} vectors, "
+                        f"but a minimum {minimum_training_vectors} is required by {requirement}. "
+                        "Provide more training vectors, reduce the IVF training parameters, "
+                        "or use a non-IVF index."
+                    )
+                    raise ValueError(INSUFFICIENT_TRAINING_DATA_MSG)
+
+            new_index = self._create_faiss_index(dimension)
 
             # Train index if needed (for IVF indexes)
-            if hasattr(self.faiss_index, "is_trained") and not self.faiss_index.is_trained:
-                nlist = self.index_config.get("nlist", 100)
-                if len(embeddings_to_add) < nlist:
-                    warning_msg = (
-                        f"Not enough vectors ({len(embeddings_to_add)}) to train IVF index "
-                        f"properly (need at least {nlist})"
-                    )
-                    logger.warning(warning_msg)
+            if hasattr(new_index, "is_trained") and not new_index.is_trained:
                 train_vectors = np.array(embeddings_to_add, dtype=np.float32)
-                self.faiss_index.train(train_vectors)
+                new_index.train(train_vectors)
+
+            self.faiss_index = new_index
 
         # Convert embeddings to numpy array
         embeddings_array = np.array(embeddings_to_add, dtype=np.float32)
